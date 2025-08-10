@@ -3,9 +3,8 @@
 <div align="center"> 
 
 [![Static Badge](https://img.shields.io/badge/HuggingFace-Dataset-red)](https://huggingface.co/datasets/dayoon/HDSQA)
-[![Static Badge](https://img.shields.io/badge/HuggingFace-Model-blue)
-](https://huggingface.co/dayoon/HybridDeepSearcher) 
-<!-- [![Paper](https://img.shields.io/badge/Paper-arXiv-b5212f.svg?logo=arxiv)](https://arxiv.org/abs/2501.05366)  -->
+[![Static Badge](https://img.shields.io/badge/HuggingFace-Model-blue)](https://huggingface.co/dayoon/HybridDeepSearcher) 
+[![Static Badge](https://img.shields.io/badge/Paper-arXiv-b5212f.svg?logo=arxiv)]
 </div>
 
 <h5 align="center"> If you like our project, please give us a star ⭐ on GitHub for the latest update.</h5>
