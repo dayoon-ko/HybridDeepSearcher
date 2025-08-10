@@ -3,7 +3,6 @@
 <div align="center"> 
 
 [![Static Badge](https://img.shields.io/badge/HuggingFace-Dataset-red)](https://huggingface.co/datasets/dayoon/HDSQA)
-
 [![Static Badge](https://img.shields.io/badge/HuggingFace-Model-blue)
 ](https://huggingface.co/dayoon/HybridDeepSearcher) 
 <!-- [![Paper](https://img.shields.io/badge/Paper-arXiv-b5212f.svg?logo=arxiv)](https://arxiv.org/abs/2501.05366)  -->
