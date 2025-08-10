@@ -1,8 +1,10 @@
 <h1 align="center"> 🔍 Hybrid Deep Searcher:</br>Integrating Parallel and Sequential Search Reasoning</a></h1>
 
 <div align="center"> 
-[![Dataset](https://img.shields.io/badge/Dataset-HDS--QA-green)](https://huggingface.co/datasets/dayoon/HDS-QA) 
-[![HuggingFace](https://img.shields.io/badge/Model-HybridDeepSearcher-blue)](https://huggingface.co/dayoon/HybridDeepSearcher) 
+[![Static Badge](https://img.shields.io/badge/HuggingFace-Dataset-red)
+](https://huggingface.co/datasets/dayoon/HDS-QA) 
+[![Static Badge](https://img.shields.io/badge/HuggingFace-Model-blue)
+](https://huggingface.co/dayoon/HybridDeepSearcher) 
 <!-- [![Paper](https://img.shields.io/badge/Paper-arXiv-b5212f.svg?logo=arxiv)](https://arxiv.org/abs/2501.05366)  -->
 </div>
 
