@@ -54,7 +54,7 @@ def get_args():
     parser.add_argument("--api_model_temperature", type=float, default=0.7)
     parser.add_argument("--api_model_top_p", type=float, default=0.8)
     parser.add_argument("--api_model_base_url", default="https://openrouter.ai/api/v1")
-    parser.add_argument("--api_model_key", default="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")
+    parser.add_argument("--api_model_key", default=os.environ["OPENROUTER_API_KEY"])
     parser.add_argument("--jina_api_key", default=os.environ["JINA_API_KEY"])
     parser.add_argument("--max_iteration", type=int, default=10)
     parser.add_argument("--batch_size_for_processing", type=int, default=64)
