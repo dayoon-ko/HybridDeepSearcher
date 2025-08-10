@@ -1,7 +1,7 @@
 <h1 align="center"> 🔍 Hybrid Deep Searcher:</br>Integrating Parallel and Sequential Search Reasoning</a></h1>
 
 <div align="center"> 
-[![Static Badge](https://img.shields.io/badge/HuggingFace-Dataset-red)](https://huggingface.co/datasets/dayoon/HDS-QA)
+[![Static Badge](https://img.shields.io/badge/HuggingFace-Dataset-red)](https://huggingface.co/datasets/dayoon/HDSQA)
 
 [![Static Badge](https://img.shields.io/badge/HuggingFace-Model-blue)
 ](https://huggingface.co/dayoon/HybridDeepSearcher) 
