@@ -54,7 +54,7 @@ def get_args():
     parser.add_argument("--api_model_temperature", type=float, default=0.7)
     parser.add_argument("--api_model_top_p", type=float, default=0.8)
     parser.add_argument("--api_model_base_url", default="https://openrouter.ai/api/v1")
-    parser.add_argument("--api_model_key", default=os.environ["OPENROUTER_API_KEY"])
+    parser.add_argument("--api_model_key", default="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")
     parser.add_argument("--jina_api_key", default=os.environ["JINA_API_KEY"])
     parser.add_argument("--max_iteration", type=int, default=10)
     parser.add_argument("--batch_size_for_processing", type=int, default=64)
@@ -273,6 +273,8 @@ def main():
                             )
                 
                 # Store raw model outputs for each item
+                items_remained_ = []
+                responses_ = []
                 for item,  response in zip(items_remained, responses):
                     if "</think>" not in response:
                         response = response.replace(f"\n\n{BEGIN_SEARCH_QUERY}", f"\n</think>\n\n{BEGIN_SEARCH_QUERY}")
@@ -305,7 +307,12 @@ def main():
                             all_queries_to_search.add(search_query)
                             relevant_info[search_query] = None
                     
+                    items_remained_.append(item)
+                    responses_.append(response)
                     batch_relevant_info.append(relevant_info)
+                
+                items_remained = items_remained_
+                responses = responses_
                 
                 # Execute search queries
                 if all_queries_to_search:
@@ -369,7 +376,6 @@ def main():
                     truncated_prev_reasoning = truncated_prev_reasoning.strip('\n')
 
                     # Collect data for batch processing
-                    batch_relevant_info.append(relevant_info)
                     batch_original_questions.append(item['question'])
                     batch_prev_reasonings.append(truncated_prev_reasoning)
                     batch_search_queries.append(relevant_info.keys())
