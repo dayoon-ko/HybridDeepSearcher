@@ -34,7 +34,7 @@ conda activate hybridds
 pip install ms-swift==3.5.3
 ```
 
-### ✨ Data Generation
+<!--### ✨ Data Generation-->
 
 ### ✨ Train
 ```bash
