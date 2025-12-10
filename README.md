@@ -1,4 +1,4 @@
-<h1 align="center"> 🔍 Hybrid Deep Searcher:</br>Integrating Parallel and Sequential Search Reasoning</a></h1>
+<h1 align="center"> 🔍 Hybrid Deep Searcher:</br>Scalable Parallel and Sequential Search Reasoning</a></h1>
 
 <div align="center"> 
 
