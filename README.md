@@ -5,6 +5,7 @@
 [![Static Badge](https://img.shields.io/badge/HuggingFace-Dataset-red)](https://huggingface.co/datasets/dayoon/HDSQA)
 [![Static Badge](https://img.shields.io/badge/HuggingFace-Model-blue)](https://huggingface.co/dayoon/HybridDeepSearcher) 
 [![Static Badge](https://img.shields.io/badge/Paper-arXiv-b5212f.svg?logo=arxiv)]()
+[![Static Badge](https://img.shields.io/badge/Homepage-Project-green)](https://hybriddeepsearcher.github.io/)
 
 </div>
 
