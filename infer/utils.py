@@ -1,15 +1,27 @@
-import os
+"""
+Utility Functions for LLM Inference
+
+This module provides:
+- LLM generation wrapper (vLLM-based Generator class)
+- API-based LLM client for webpage summarization
+- Text extraction utilities (answer extraction, query parsing)
+"""
+
 import re
 import json
-import torch
-from openai import OpenAI
-from typing import List, Dict, Optional, Any
-import requests
 import time
-from urllib.parse import urlparse
+
+import torch
+import requests
+from openai import OpenAI
+from typing import List, Dict, Any, Optional
 from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
+
+# ============================================================================
+# Prompts
+# ============================================================================
 
 prompt_for_webpage_to_reasonchain_instruction = """**Task Instruction:**
 
@@ -51,20 +63,38 @@ Now you should analyze each web page and find helpful information based on the c
 """
 
 
+# ============================================================================
+# API-based LLM Client
+# ============================================================================
+
 def get_response_from_llm(
     args,
     messages: List[Dict[str, Any]],
     depth: int = 0,
-    query_for_the_prompt: str = None,
+    query_for_the_prompt: Optional[str] = None,
     return_type: str = "str"
-):
+) -> Any:
+    """
+    Get response from an API-based LLM (OpenRouter or local vLLM server).
+    
+    Args:
+        args: Arguments containing API configuration.
+        messages: Chat messages in OpenAI format.
+        depth: Recursion depth for retries.
+        query_for_the_prompt: Optional query identifier for tuple return.
+        return_type: "str" for string response, "tuple" for (query, response).
+    
+    Returns:
+        Response string or tuple based on return_type.
+    """
     client = OpenAI(
-      base_url=args.api_model_base_url,
-      api_key=args.api_model_key,
+        base_url=args.api_model_base_url,
+        api_key=args.api_model_key,
     )
     
     try:
         if "openrouter" in args.api_model_base_url:
+            # OpenRouter API with reasoning exclusion
             url = f"{args.api_model_base_url}/chat/completions"
             headers = {
                 "Authorization": f"Bearer {args.api_model_key}",
@@ -78,21 +108,27 @@ def get_response_from_llm(
                     "exclude": True      
                 }
             }
-            response = requests.post(url, headers=headers, data=json.dumps(payload), verify=False)
+            response = requests.post(
+                url, headers=headers, data=json.dumps(payload), verify=False
+            )
             response = response.json()
             content = response['choices'][0]['message']['content'].strip()
         else:
+            # Standard OpenAI-compatible API
             response = client.chat.completions.create(
                 model=args.api_model,
                 messages=messages,
                 max_tokens=args.api_model_max_tokens,
                 temperature=args.api_model_temperature,
                 top_p=args.api_model_top_p,
-                extra_body={"top_k": 20,
-                            "chat_template_kwargs": {"enable_thinkng": False}}
+                extra_body={
+                    "top_k": 20,
+                    "chat_template_kwargs": {"enable_thinking": False}
+                }
             )
             if hasattr(response.choices[0].message, 'content') and response.choices[0].message.content:
                 content = response.choices[0].message.content
+        
         if return_type == "str":
             return content.strip()
         elif return_type == "tuple":
@@ -104,145 +140,148 @@ def get_response_from_llm(
             return get_response_from_llm(
                 args=args,
                 messages=messages, 
-                depth=depth+1, 
+                depth=depth + 1, 
                 query_for_the_prompt=query_for_the_prompt, 
                 return_type=return_type
             )
         raise e
 
 
-def extract_answer(output, mode='gen'):
+# ============================================================================
+# Answer Extraction
+# ============================================================================
+
+def extract_answer(output: str, mode: str = 'gen') -> str:
+    """
+    Extract answer from model output.
+    
+    Args:
+        output: Model output string.
+        mode: 'gen' for boxed answer extraction, 'infogen' for Final Information extraction.
+    
+    Returns:
+        Extracted answer string.
+    """
     extracted_text = ''
+    
     if mode == 'infogen':
-        # Extract content after **Final Information** or **Modified Reasoning Steps**
+        # Extract content after **Final Information**
         pattern_info = "**Final Information**"
         if pattern_info in output:
-            extracted_text = output.split(pattern_info)[-1].replace("\n","").strip("```").strip()
+            extracted_text = output.split(pattern_info)[-1]
+            extracted_text = extracted_text.replace("\n", "").strip("```").strip()
         else:
             extracted_text = "No helpful information found."
     else:
+        # Extract content from \boxed{...}
         pattern = r'\\boxed\{(.*)\}'
         matches = re.findall(pattern, output)
         if matches:
-            extracted_text = matches[-1]  # Take the last match
+            extracted_text = matches[-1]
+            
+            # Handle nested \text{...}
             inner_pattern = r'\\text\{(.*)\}'
             inner_matches = re.findall(inner_pattern, extracted_text)
             if inner_matches:
-                extracted_text = inner_matches[-1]  # Take the last match
+                extracted_text = inner_matches[-1]
+            
             extracted_text = extracted_text.strip("()")
+    
     return extracted_text
 
 
+# ============================================================================
+# Query Extraction
+# ============================================================================
 
-def extract_between(text: str, begin_search_query_token: str, end_search_query_token: str) -> List[str]:
-    '''
-    Function to extract queries between two query tokens
-    '''
+def extract_between(
+    text: str, 
+    begin_search_query_token: str, 
+    end_search_query_token: str
+) -> Optional[List[str]]:
+    """
+    Extract queries between two delimiter tokens.
     
-    # Set pattern 
+    Args:
+        text: Text containing search queries.
+        begin_search_query_token: Start delimiter (e.g., "<|begin_search_queries|>").
+        end_search_query_token: End delimiter (e.g., "<|end_search_queries|>").
+    
+    Returns:
+        List of extracted queries or None if no valid queries found.
+    """
+    # Escape special characters for regex
     pattern_begin = begin_search_query_token.replace('|', '\\|')
-    pattern = begin_search_query_token.replace('|', '\\|') + "([\s\S]*?)" + end_search_query_token.replace('|', '\\|')
+    pattern = (
+        begin_search_query_token.replace('|', '\\|') + 
+        r"([\s\S]*?)" + 
+        end_search_query_token.replace('|', '\\|')
+    )
     
-    # Return if wrong format
+    # Return None if multiple begin tokens found (malformed)
     if len(re.findall(pattern_begin, text)) > 1:
-        return
+        return None
+    
     output = re.findall(pattern, text)
     if len(output) == 0:
-        return
+        return None
     
-    # Split queries
+    # Split queries by newline or semicolon
     output = output[0].strip().strip("\n")
     output = [i.strip().strip(";") for i in output.split("\n")]
+    
     if len(output) == 1 and ";" in output[0]:
         output = output[0].split(";")
         output = [o.strip() for o in output]
     
-    # Return output when queries are extracted
+    # Filter empty queries
     output = [o for o in output if len(o) > 0]
-    return output
+    return output if output else None
 
 
-def replace_recent_steps(origin_str, replace_str):
-    """
-    Replaces specific steps in the original reasoning steps with new steps.
-    If a replacement step contains "DELETE THIS STEP", that step is removed.
-
-    Parameters:
-    - origin_str (str): The original reasoning steps.
-    - replace_str (str): The steps to replace or delete.
-
-    Returns:
-    - str: The updated reasoning steps after applying replacements.
-    """
-
-    def parse_steps(text):
-        """
-        Parses the reasoning steps from a given text.
-
-        Parameters:
-        - text (str): The text containing reasoning steps.
-
-        Returns:
-        - dict: A dictionary mapping step numbers to their content.
-        """
-        step_pattern = re.compile(r"Step\s+(\d+):\s*")
-        steps = {}
-        current_step_num = None
-        current_content = []
-
-        for line in text.splitlines():
-            step_match = step_pattern.match(line)
-            if step_match:
-                # If there's an ongoing step, save its content
-                if current_step_num is not None:
-                    steps[current_step_num] = "\n".join(current_content).strip()
-                current_step_num = int(step_match.group(1))
-                content = line[step_match.end():].strip()
-                current_content = [content] if content else []
-            else:
-                if current_step_num is not None:
-                    current_content.append(line)
-        
-        # Save the last step if any
-        if current_step_num is not None:
-            steps[current_step_num] = "\n".join(current_content).strip()
-        
-        return steps
-
-    # Parse the original and replacement steps
-    origin_steps = parse_steps(origin_str)
-    replace_steps = parse_steps(replace_str)
-
-    # Apply replacements
-    for step_num, content in replace_steps.items():
-        if "DELETE THIS STEP" in content:
-            # Remove the step if it exists
-            if step_num in origin_steps:
-                del origin_steps[step_num]
-        else:
-            # Replace or add the step
-            origin_steps[step_num] = content
-
-    # Sort the steps by step number
-    sorted_steps = sorted(origin_steps.items())
-
-    # Reconstruct the reasoning steps as a single string
-    new_reasoning_steps = "\n\n".join([f"{content}" for num, content in sorted_steps])
-
-    return new_reasoning_steps
+# ============================================================================
+# vLLM-based Generator
+# ============================================================================
 
 class Generator:
-    def __init__(self, model_id_or_path="Qwen/Qwen3-32B"):
+    """
+    vLLM-based text generator for local LLM inference.
+    
+    Supports Qwen3 models with thinking mode and custom sampling parameters.
+    """
+    
+    def __init__(self, model_id_or_path: str = "Qwen/Qwen3-32B"):
+        """
+        Initialize the generator with a model.
+        
+        Args:
+            model_id_or_path: HuggingFace model ID or local path.
+        """
         self.llm = LLM(
             model=model_id_or_path, 
             enforce_eager=True,
             tensor_parallel_size=torch.cuda.device_count(),
             gpu_memory_utilization=0.9,
-            max_num_seqs=32, # Reduce this number if you have less GPU memory
+            max_num_seqs=32,
         )
         self.tokenizer = AutoTokenizer.from_pretrained(model_id_or_path)
+        self.params = {}
 
-    def apply_chat_template(self, prompt, enable_thinking=True):
+    def apply_chat_template(
+        self, 
+        prompt: str, 
+        enable_thinking: bool = True
+    ) -> str:
+        """
+        Apply chat template to a prompt.
+        
+        Args:
+            prompt: User prompt string.
+            enable_thinking: Whether to enable thinking mode.
+        
+        Returns:
+            Formatted prompt string with chat template applied.
+        """
         return self.tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}], 
             tokenize=False, 
@@ -250,10 +289,37 @@ class Generator:
             enable_thinking=enable_thinking
         )
        
-    def generate(self, prompts, max_tokens, sampling_params=None, n=1, stop=None, repetition_penalty=None, apply_chat=True, enable_thinking=True):
+    def generate(
+        self, 
+        prompts: List[str], 
+        max_tokens: int,
+        sampling_params: Optional[Dict] = None,
+        n: int = 1,
+        stop: Optional[List[str]] = None,
+        repetition_penalty: Optional[float] = None,
+        apply_chat: bool = True,
+        enable_thinking: bool = True
+    ) -> List[str]:
+        """
+        Generate responses for a batch of prompts.
+        
+        Args:
+            prompts: List of input prompts.
+            max_tokens: Maximum tokens to generate.
+            sampling_params: Custom sampling parameters dict.
+            n: Number of responses per prompt.
+            stop: List of stop sequences.
+            repetition_penalty: Repetition penalty value.
+            apply_chat: Whether to apply chat template.
+            enable_thinking: Whether to enable thinking mode.
+        
+        Returns:
+            List of generated response strings.
+        """
+        # Set sampling parameters
         if sampling_params:
             self.params = sampling_params
-        else:   
+        else:
             self.params = {
                 "temperature": 0.6 if enable_thinking else 0.7,
                 "top_p": 0.95 if enable_thinking else 0.8,
@@ -261,19 +327,21 @@ class Generator:
                 "min_p": 0.0,
                 "n": n
             }
-            
-        # Set additional sampling params
+        
         self.params["max_tokens"] = max_tokens
+        
+        # Handle stop sequences
         if stop is not None:
             if isinstance(stop, str):
                 self.params["stop"] = [stop]
             elif isinstance(stop, list):
                 self.params["stop"] = stop
             self.params["include_stop_str_in_output"] = True
+        
         if repetition_penalty is not None:
             self.params["repetition_penalty"] = repetition_penalty 
-            
-        # Set prompts
+        
+        # Apply chat template if needed
         if apply_chat:
             prompts = [self.apply_chat_template(p, enable_thinking) for p in prompts]
         
@@ -282,5 +350,5 @@ class Generator:
             prompts, 
             SamplingParams(**self.params),
         )
+        
         return [response.outputs[0].text for response in responses]
-

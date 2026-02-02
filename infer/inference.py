@@ -1,17 +1,28 @@
-import re
 import os
-import time
-import json 
-import torch
+import json
 import asyncio
-import logging 
+import logging
 import argparse
 import datasets
-from openai import OpenAI
-from utils import *
-from bing_search import *
-from typing import List, Dict, Any, Optional
 
+from utils import (
+    Generator, 
+    extract_answer, 
+    extract_between, 
+    get_response_from_llm, 
+    prompt_for_webpage_to_reasonchain_instruction
+)
+from bing_search import (
+    jina_web_search_all_queries, 
+    fetch_page_content, 
+    extract_snippet_with_context
+)
+from typing import List, Dict
+
+
+# ============================================================================
+# Constants
+# ============================================================================
 
 PROMPT = """**Task Instruction:**
 
@@ -32,16 +43,36 @@ Your search queries here (multiple queries can be placed together seperated by "
 **Remember:**
 * Clearly separate each search query.
 * Combine multiple queries into a single search action when they can be run simultaneously.
-* 
 """
+
+BEGIN_SEARCH_QUERY = "<|begin_search_queries|>"
+END_SEARCH_QUERY = "<|end_search_queries|>"
+BEGIN_SEARCH_RESULT = "<|begin_search_results|>"
+END_SEARCH_RESULT = "<|end_search_results|>"
+
+DATASET_PATHS = {
+    "browse_comp": "datasets/BrowseComp/test.json",
+    "med_browse_comp": "datasets/MedBrowseComp/test.json",
+    "musique": "datasets/MuSiQue/dev.json",
+    "fanoutqa": "datasets/FanOutQA/dev.json",
+    "frames": "datasets/FRAMES/test.json",
+}
+
+
+# ============================================================================
+# Argument Parsing
+# ============================================================================
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset_name", "-d", required=True, choices=["musique", "browse_comp", "hle", "gpqa", "fanoutqa", "cwq", "hotpotqa", "med_browse_comp", "multihopqa", "frames"]) 
+    parser.add_argument("--dataset_name", "-d", required=True, 
+                        choices=["musique", "browse_comp", "hle", "gpqa", "fanoutqa", 
+                                 "cwq", "hotpotqa", "med_browse_comp", "multihopqa", "frames"]) 
     parser.add_argument("--dataset_split", "-sp", default="train")
-    parser.add_argument("--model_id_or_path", "-m", default="dayoon/Qwen3-8B-sft")
+    parser.add_argument("--model_id_or_path", "-m", default="dayoon/HybridDeepSearcher-GRPO")
     parser.add_argument("--apply_chat", type=bool, default=True)
-    parser.add_argument("--use_jina", action="store_true", help="Whether to use jina for extracting text from urls")
+    parser.add_argument("--use_jina", action="store_true", 
+                        help="Whether to use jina for extracting text from urls")
     parser.add_argument("--max_tokens", type=int, default=4096)
     parser.add_argument("--max_doc_len", type=int, default=1024) 
     parser.add_argument("--temperature", type=float, default=0.7)
@@ -49,40 +80,311 @@ def get_args():
     parser.add_argument("--output_dir", type=str, default="./results")
     parser.add_argument("--start_idx", "-s", type=int)
     parser.add_argument("--end_idx", "-e", type=int)
-    parser.add_argument("--api_model", "-am", default="qwen/qwen3-235b-a22b-2507") #"qwen/qwen3-32b"
+    parser.add_argument("--api_model", "-am", default="Qwen/Qwen3-32B")
     parser.add_argument("--api_model_max_tokens", type=int, default=2048)
     parser.add_argument("--api_model_temperature", type=float, default=0.7)
     parser.add_argument("--api_model_top_p", type=float, default=0.8)
-    parser.add_argument("--api_model_base_url", default="https://openrouter.ai/api/v1")
-    parser.add_argument("--api_model_key", default="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")
-    parser.add_argument("--jina_api_key", default=os.environ["JINA_API_KEY"])
+    parser.add_argument("--api_model_base_url", default="http://localhost:9001/v1")
+    parser.add_argument("--api_model_key", default=os.environ.get("OPENROUTER_API_KEY", ""))
+    parser.add_argument("--jina_api_key", default=os.environ.get("JINA_API_KEY", ""))
     parser.add_argument("--max_iteration", type=int, default=10)
-    parser.add_argument("--batch_size_for_processing", type=int, default=64)
+    parser.add_argument("--batch_size_for_processing", type=int, default=16)
     args = parser.parse_args()
     return args
 
 
+# ============================================================================
+# Logger Setup
+# ============================================================================
+
+def setup_logger():
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+    return logger
+
+
+# ============================================================================
+# Dataset Loading
+# ============================================================================
+
+def load_dataset(args):
+    """Load dataset from file or HuggingFace."""
+    if args.dataset_name in DATASET_PATHS:
+        with open(DATASET_PATHS[args.dataset_name], "r") as f:
+            dataset = json.load(f)
+    else:
+        dataset = datasets.load_dataset(args.dataset_name)[args.dataset_split]
+        dataset = [item for item in dataset]
+    
+    # Select subset of dataset
+    if args.start_idx is not None and args.end_idx is not None:
+        dataset = dataset[args.start_idx:args.end_idx]
+        
+    # Split dataset into batches
+    if args.batch_size_for_processing > 0:
+        batches = [
+            dataset[i:i+args.batch_size_for_processing] 
+            for i in range(0, len(dataset), args.batch_size_for_processing)
+        ]
+        return batches
+    else:
+        return [dataset]
+
+
+# ============================================================================
+# Cache Management
+# ============================================================================
+
+def get_cache(output_dir):
+    """Load search and URL caches from disk."""
+    search_cache = {}
+    url_cache = {}
+    
+    search_cache_path = f"{output_dir}/search_cache.json"
+    url_cache_path = f"{output_dir}/url_cache.json"
+    
+    if os.path.exists(search_cache_path):
+        with open(search_cache_path, "r") as f:
+            search_cache = json.load(f)
+    
+    if os.path.exists(url_cache_path):
+        with open(url_cache_path, "r") as f:
+            url_cache = json.load(f)
+    
+    return search_cache, url_cache
+
+
+def save_cache(output_dir, search_cache, url_cache):
+    """Save search and URL caches to disk."""
+    with open(f"{output_dir}/search_cache.json", "w") as f:
+        json.dump(search_cache, f, indent=2)
+    with open(f"{output_dir}/url_cache.json", "w") as f:
+        json.dump(url_cache, f, indent=2)
+
+
+# ============================================================================
+# Item Initialization
+# ============================================================================
+
+def normalize_question_field(item):
+    """Normalize question field name across different datasets."""
+    if "question" not in item:
+        if "Question" in item:
+            item["question"] = item["Question"]
+            del item["Question"]
+        elif "query" in item:
+            item["question"] = item["query"]
+            del item["query"]
+    return item
+
+
+def initialize_item(item, get_prompt_fn):
+    """Initialize item with required fields for processing."""
+    item = normalize_question_field(item)
+    item["finished"] = False
+    item["prompt"] = get_prompt_fn(item)
+    item["output"] = ""
+    item["output_history"] = []
+    item["search_count"] = []
+    item["executed_search_queries"] = []
+    item["related_info_analysis"] = []
+    item["relevant_info"] = {}
+    return item
+
+
+# ============================================================================
+# Response Processing
+# ============================================================================
+
+def process_model_response(item, response, search_cache, top_k):
+    """
+    Process model response to extract search queries and determine next action.
+    
+    Returns:
+        tuple: (needs_search: bool, relevant_info: dict, queries_to_search: set)
+    """
+    # Fix missing </think> tag
+    if "</think>" not in response:
+        response = response.replace(
+            f"\n\n{BEGIN_SEARCH_QUERY}", 
+            f"\n</think>\n\n{BEGIN_SEARCH_QUERY}"
+        )
+    
+    # Update item with response
+    search_queries = extract_between(response, BEGIN_SEARCH_QUERY, END_SEARCH_QUERY)
+    item["prompt"] += response
+    item["output"] += response
+    item["output_history"].append(response)
+
+    # If no search queries, extract final answer and mark as finished
+    if search_queries is None:    
+        item["finished"] = True
+        item["generated_answer"] = extract_answer(response)
+        return False, {}, set()
+    
+    # Process search queries
+    relevant_info = {}
+    queries_to_search = set()
+    
+    for search_query in search_queries:
+        # Skip already executed queries
+        if search_query in set(item['executed_search_queries']):
+            repeat_msg = (
+                f"\n{BEGIN_SEARCH_RESULT}\nYou have searched this query. "
+                "Please refer to previous results.\n"
+                f"{END_SEARCH_RESULT}\n"
+            )
+            relevant_info[search_query] = repeat_msg
+            continue
+        
+        # Use cached results if available
+        if search_query in search_cache:
+            results = search_cache[search_query]
+            relevant_info[search_query] = results[:top_k]
+        else:
+            queries_to_search.add(search_query)
+            relevant_info[search_query] = None
+    
+    return True, relevant_info, queries_to_search
+
+
+def update_item_with_search_results(item, relevant_info, all_search_results, search_cache, top_k):
+    """Update item with search results and return URLs to fetch."""
+    # Update relevant_info with search results
+    for query, info in relevant_info.items():
+        if info is None:
+            results = all_search_results[query]
+            relevant_info[query] = results[:top_k]
+            search_cache[query] = results
+    
+    item['relevant_info'].update(relevant_info)
+    item['search_count'].append(len(relevant_info))
+    item['executed_search_queries'].extend(relevant_info.keys())
+    
+    # Extract URLs and snippets
+    urls_to_fetch = []
+    snippets = {}
+    
+    for _, results in relevant_info.items():
+        if isinstance(results, str):
+            continue
+        for info in results:
+            if 'url' in info:
+                urls_to_fetch.append(info['url'])
+                if 'snippet' in info:
+                    snippets[info['url']] = info['snippet']
+    
+    return urls_to_fetch, snippets
+
+
+# ============================================================================
+# Reasoning Truncation
+# ============================================================================
+
+def truncate_reasoning_steps(output):
+    """Truncate previous reasoning steps for context window management."""
+    all_reasoning_steps = output.replace('\n\n', '\n').split("\n")
+    truncated_prev_reasoning = ""
+    
+    for i, step in enumerate(all_reasoning_steps):
+        truncated_prev_reasoning += f"Step {i + 1}: {step}\n\n"
+    
+    prev_steps = truncated_prev_reasoning.split('\n\n')
+    
+    if len(prev_steps) <= 5:
+        truncated_prev_reasoning = '\n\n'.join(prev_steps)
+    else:
+        truncated_prev_reasoning = ''
+        for i, step in enumerate(prev_steps):
+            should_include = (
+                i == 0 or 
+                i >= len(prev_steps) - 4 or 
+                BEGIN_SEARCH_QUERY in step or 
+                BEGIN_SEARCH_RESULT in step
+            )
+            if should_include:
+                truncated_prev_reasoning += step + '\n\n'
+            else:
+                if truncated_prev_reasoning[-len('\n\n...\n\n'):] != '\n\n...\n\n':
+                    truncated_prev_reasoning += '...\n\n'
+    
+    return truncated_prev_reasoning.strip('\n')
+
+
+# ============================================================================
+# Document Formatting
+# ============================================================================
+
+def format_documents_for_summarization(relevant_info, executed_queries, url_cache, max_doc_len):
+    """Format documents from search results for batch summarization."""
+    formatted_documents = {}
+    
+    for sub_query in executed_queries:
+        sub_relevant_info = relevant_info[sub_query]
+        
+        # Skip if already a string (e.g., "already searched" message)
+        if isinstance(sub_relevant_info, str):
+            formatted_documents[sub_query] = sub_relevant_info
+            continue
+        
+        doc_str = ""
+        for i, doc_info in enumerate(sub_relevant_info):
+            url = doc_info.get('url', "")
+            raw_context = url_cache.get(url, "")
+            
+            # Clean snippet
+            snippet = doc_info.get("snippet")
+            if snippet:
+                snippet = snippet.replace('<b>', '').replace('</b>', '')
+            doc_info['snippet'] = snippet
+            
+            # Extract context around snippet
+            success, filtered_context = extract_snippet_with_context(
+                raw_context, snippet, context_chars=max_doc_len
+            )
+            context = filtered_context if success else raw_context[:max_doc_len]
+            doc_info['context'] = context
+            
+            doc_str += f"**Web Page {i + 1}:**\n"
+            doc_str += json.dumps(doc_info, ensure_ascii=False, indent=2) + "\n"
+        
+        formatted_documents[sub_query] = doc_str
+    
+    return formatted_documents
+
+
+# ============================================================================
+# Webpage Analysis (API Model)
+# ============================================================================
 
 async def generate_webpage_to_reasonchain_batch(
         args,
         logger,
         original_questions: List[str],
         prev_reasonings: List[str],
-        search_queries: List[List[str]],    # list of queries per sequence
-        documents: Dict[str, str],          # { search_query: formatted_doc_string }
+        search_queries: List[List[str]],
+        documents: Dict[str, str],
         dataset_name: str,
         max_tokens: int = 2048,
-    ) -> List[Dict[str, str]]:  # returns list of dict of outputs per query per sequence
+    ) -> List[Dict[str, str]]:
+    """Batch process webpages to extract relevant information using API model."""
     
     logger.info(f"API model: {args.api_model}")
+    
     def get_reasonchain_prompt(prev_reasoning, query, document):
         prompt = prompt_for_webpage_to_reasonchain_instruction.format(
             prev_reasoning=prev_reasoning, 
             search_query=query, 
             document=document
         )
-        prompt = [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": prompt}]
-        return prompt
+        return [
+            {"role": "system", "content": "You are a helpful assistant."}, 
+            {"role": "user", "content": prompt}
+        ]
     
     # Prepare prompts for each query
     all_user_prompts = {}
@@ -100,103 +402,256 @@ async def generate_webpage_to_reasonchain_batch(
             return_type="tuple",
             depth=0,
         )
-        # logger.info(f"Query {idx} completed")
         return result
     
-    # Kick off all requests concurrently
-    tasks = [asyncio.create_task(run_one(idx, q, p)) for idx, (q, p) in enumerate(all_user_prompts.items())]
+    # Execute all requests concurrently
+    tasks = [
+        asyncio.create_task(run_one(idx, q, p)) 
+        for idx, (q, p) in enumerate(all_user_prompts.items())
+    ]
     outputs = await asyncio.gather(*tasks)
     
     # Extract answers from outputs
-    extracted_infos = {query: extract_answer(output, mode='infogen') for query, output in outputs}
+    extracted_infos = {
+        query: extract_answer(output, mode='infogen') 
+        for query, output in outputs
+    }
     return extracted_infos
 
 
-def load_dataset(args):
-    # Load dataset
-    if args.dataset_name == "browse_comp":
-        with open("datasets/BrowseComp/test.json", "r") as f:
-            dataset = json.load(f)
-    elif args.dataset_name == "med_browse_comp":
-        with open("datasets/MedBrowseComp/test.json", "r") as f:
-            dataset = json.load(f)
-    elif args.dataset_name == "musique":
-        with open("datasets/MuSiQue/dev.json", "r") as f:
-            dataset = json.load(f)
-    elif args.dataset_name == "fanoutqa":
-        with open("datasets/FanOutQA/dev.json", "r") as f:
-            dataset = json.load(f)
-    elif args.dataset_name == "frames":
-        with open("datasets/FRAMES/test.json", "r") as f:
-            dataset = json.load(f)
-    else:
-        dataset = datasets.load_dataset(args.dataset_name)[args.dataset_split]
-        dataset = [item for item in dataset]
+# ============================================================================
+# Final Answer Generation
+# ============================================================================
+
+def prepare_item_for_final_answer(item):
+    """Prepare item prompt/output for final answer generation."""
+    prompt = item["prompt"].strip() 
+    output = item["output"].strip()
     
-    # Select subset of dataset
-    if args.start_idx is not None and args.end_idx is not None:
-        dataset = dataset[args.start_idx:args.end_idx]
+    # Remove trailing search tokens
+    tokens_to_strip = [END_SEARCH_QUERY, BEGIN_SEARCH_QUERY, END_SEARCH_RESULT, BEGIN_SEARCH_RESULT]
+    
+    while True:
+        stripped = False
+        for token in tokens_to_strip:
+            if prompt.endswith(token):
+                prompt = prompt[:-len(token)].strip()
+                output = output[:-len(token)].strip()
+                stripped = True
+                break
+        if not stripped:
+            break
+    
+    prompt = prompt.strip()
+    output = output.strip()
+    
+    if not prompt.endswith("</think>"):
+        final_answer_prefix = "\n</think>\n\n**Final Answer:**\n\\boxed{"
+        prompt += final_answer_prefix
+        output += final_answer_prefix
+        item["output_history"].append(final_answer_prefix)
+    
+    item["prompt"] = prompt 
+    item["output"] = output
+    return item
+
+
+def generate_final_answers(generator, batch, args):
+    """Generate final answers for items that haven't finished naturally."""
+    items_to_generate_final_answer = [
+        item for item in batch 
+        if not item["finished"] or "generated_answer" not in item or item["generated_answer"] == ""
+    ]
+    
+    if not items_to_generate_final_answer:
+        return
+    
+    # Prepare items
+    items_to_generate_final_answer = [
+        prepare_item_for_final_answer(item) 
+        for item in items_to_generate_final_answer
+    ]
+    
+    # Generate responses
+    prompts = [item["prompt"] for item in items_to_generate_final_answer]
+    responses = generator.generate(
+        prompts, 
+        max_tokens=args.max_tokens, 
+        apply_chat=False,
+        enable_thinking=False,
+    )
+    
+    # Update items with responses
+    for item, response in zip(items_to_generate_final_answer, responses):
+        item["prompt"] += response
+        item["output"] += response
+        item["output_history"][-1] += response
+        item["finished"] = True
+        item["generated_answer"] = response.strip("}")
+
+
+# ============================================================================
+# Main Processing Loop
+# ============================================================================
+
+def process_batch_iteration(
+    args, logger, generator, batch, items_remained, 
+    search_cache, url_cache
+):
+    """Process one iteration of the batch inference loop."""
+    
+    # Initialize batch variables
+    batch_relevant_info = []
+    batch_original_questions = []
+    batch_prev_reasonings = []
+    batch_search_queries = []
+    batch_documents = {}
+    batch_sequences = []
+    all_urls_to_fetch = set()
+    all_queries_to_search = set()
+    url_snippets = {}
+    
+    # Generate model responses
+    prompts = [item["prompt"] for item in items_remained]
+    responses = generator.generate(
+        prompts, 
+        max_tokens=args.max_tokens, 
+        stop=[END_SEARCH_QUERY], 
+        apply_chat=False,
+        enable_thinking=True,
+    )
+    
+    # Process responses
+    items_remained_ = []
+    responses_ = []
+    
+    for item, response in zip(items_remained, responses):
+        needs_search, relevant_info, queries_to_search = process_model_response(
+            item, response, search_cache, args.top_k
+        )
         
-    # Split dataset into batches
-    if args.batch_size_for_processing > 0:
-        batches = [dataset[i:i+args.batch_size_for_processing] for i in range(0, len(dataset), args.batch_size_for_processing)]
-        return batches
-    else:
-        return [dataset]
+        if not needs_search:
+            continue
+        
+        items_remained_.append(item)
+        responses_.append(response)
+        batch_relevant_info.append(relevant_info)
+        all_queries_to_search.update(queries_to_search)
+    
+    items_remained = items_remained_
+    responses = responses_
+    
+    # Execute search queries
+    all_search_results = {}
+    if all_queries_to_search:
+        logger.info(f"Executing {len(all_queries_to_search)} queries...")
+        all_search_results = asyncio.run(
+            jina_web_search_all_queries(
+                list(all_queries_to_search),
+                jina_api_key=args.jina_api_key,
+            )
+        )
+    
+    # Process search results and collect URLs
+    for item, response, relevant_info in zip(items_remained, responses, batch_relevant_info):
+        urls_to_fetch, snippets = update_item_with_search_results(
+            item, relevant_info, all_search_results, search_cache, args.top_k
+        )
+        
+        # Filter URLs that are not cached
+        urls_to_fetch_filtered = [u for u in urls_to_fetch if u not in url_cache]
+        
+        for url in urls_to_fetch_filtered:
+            all_urls_to_fetch.add(url)
+            url_snippets[url] = snippets.get(url, "")
+        
+        # Collect data for batch processing
+        truncated_prev_reasoning = truncate_reasoning_steps(item['output'])
+        batch_original_questions.append(item['question'])
+        batch_prev_reasonings.append(truncated_prev_reasoning)
+        batch_search_queries.append(relevant_info.keys())
+        batch_sequences.append(item)
+    
+    # Fetch all URLs (synchronous with ThreadPoolExecutor for timeout control)
+    if all_urls_to_fetch:
+        logger.info(f"Fetching {len(all_urls_to_fetch)} URLs...")
+        try:
+            fetched_contents = fetch_page_content(
+                list(all_urls_to_fetch),
+                use_jina=args.use_jina,
+                jina_api_key=args.jina_api_key,
+                snippets=url_snippets
+            )
+            logger.info(f"Fetched {len(fetched_contents)} URLs successfully.")
+        except Exception as e:
+            logger.info(f"Error during batch URL fetching: {e}")
+            fetched_contents = {url: f"Error fetching URL: {e}" for url in all_urls_to_fetch}
+        
+        for url, content in fetched_contents.items():
+            url_cache[url] = content
+    
+    # Format documents for summarization
+    for relevant_info, executed_queries in zip(batch_relevant_info, batch_search_queries):
+        formatted_documents = format_documents_for_summarization(
+            relevant_info, executed_queries, url_cache, args.max_doc_len
+        )
+        batch_documents.update(formatted_documents)
+    
+    # Batch summarization
+    if batch_sequences:
+        logger.info(f"Batch summarizing {len(batch_sequences)} sequences...")
+        webpage_analyses = asyncio.run(
+            generate_webpage_to_reasonchain_batch(
+                args,
+                logger,
+                original_questions=batch_original_questions,
+                prev_reasonings=batch_prev_reasonings,
+                search_queries=batch_search_queries,
+                documents=batch_documents,
+                dataset_name=args.dataset_name,
+                max_tokens=args.api_model_max_tokens
+            )
+        )
+        logger.info("Batch summarization completed.")
 
-def get_cache(output_dir):
-    # Set cache for search
-    if os.path.exists(f"{output_dir}/search_cache.json"):
-        with open(f"{output_dir}/search_cache.json", "r") as f:
-            search_cache = json.load(f)
-    else:
-        search_cache = {}
-    if os.path.exists(f"{output_dir}/url_cache.json"):
-        with open(f"{output_dir}/url_cache.json", "r") as f:
-            url_cache = json.load(f)
-    else:
-        url_cache = {}
-    return search_cache, url_cache
+        # Assign outputs to sequences
+        for seq, queries in zip(batch_sequences, batch_search_queries):
+            combined_analysis = ""
+            for query in queries:
+                analysis = webpage_analyses[query]
+                combined_analysis += f"{query}: {analysis}\n"
+                seq["related_info_analysis"].append(analysis)
+            
+            append_text = f"\n\n{BEGIN_SEARCH_RESULT}\n{combined_analysis.strip()}\n{END_SEARCH_RESULT}\n\n<think>\n"
+            seq['prompt'] += append_text
+            seq['output'] += append_text
+    
+    return items_remained
 
-def save_cache(output_dir, search_cache, url_cache):
-    with open(f"{output_dir}/search_cache.json", "w") as f:
-        json.dump(search_cache, f, indent=2)
-    with open(f"{output_dir}/url_cache.json", "w") as f:
-        json.dump(url_cache, f, indent=2)
+
+# ============================================================================
+# Main Function
+# ============================================================================
 
 def main():
     args = get_args()
+    logger = setup_logger()
     
-    BEGIN_SEARCH_QUERY = "<|begin_search_queries|>"
-    END_SEARCH_QUERY = "<|end_search_queries|>"
-    BEGIN_SEARCH_RESULT = "<|begin_search_results|>"
-    END_SEARCH_RESULT = "<|end_search_results|>"
-    
-    dataset_name = args.dataset_name.split("/")[-1]
-    model_name = args.model_id_or_path.split("/")[-1]
+    # Setup output paths
     output_dir = f"{args.output_dir}/{args.dataset_name}"
     os.makedirs(output_dir, exist_ok=True)
     output_path = f"{output_dir}/output.json"
     
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-    logger.addHandler(stream_handler)
-    
     logger.info(f"Output file path: {output_path}")
     
-    # Load dataset
+    # Load dataset and caches
     dataset = load_dataset(args)
-    
-    # Get cache
     search_cache, url_cache = get_cache(output_dir)
     
-    # Use Generator for LLM and tokenizer
+    # Initialize generator
     generator = Generator(model_id_or_path=args.model_id_or_path)
     
-    # Get prompt
+    # Define prompt function
     def get_prompt(item):
         prompt = PROMPT
         prompt += "\nYou should provide your final answer in the format \\boxed{{YOUR_ANSWER}}."
@@ -206,337 +661,81 @@ def main():
     
     output_data = []
     
+    # Process each batch
     for batch_idx, batch in enumerate(dataset):
-        # Check if batch is already processed
         output_path_for_batch = output_path.replace(".json", f"_batch_{batch_idx}.json")
+        
+        # Skip if already processed
         if os.path.exists(output_path_for_batch):
             logger.info(f"Batch {batch_idx} already processed, skipping...")
             with open(output_path_for_batch, "r") as f:
                 batch = json.load(f)
                 output_data.extend(batch)
             continue
-        else:
-            logger.info(f"Processing batch {batch_idx}...")
         
-        # Initialize items in batch
+        logger.info(f"Processing batch {batch_idx}...")
+        
+        # Initialize items
         for item in batch:
-            if "question" not in item:
-                if "Question" in item:
-                    item["question"] = item["Question"]
-                    del item["Question"]
-                elif "query" in item:
-                    item["question"] = item["query"]
-                    del item["query"]
-            item["finished"] = False
-            item["prompt"] = get_prompt(item)
-            item["output"] = ""
-            item["output_history"] = []
-            item["search_count"] = []
-            item["executed_search_queries"] = []
-            item["related_info_analysis"] = []
-            item["relevant_info"] = {}
+            initialize_item(item, get_prompt)
         
-        # Main loop
+        # Main inference loop
         try:
             num_iteration = 0
             while True:
                 num_iteration += 1
                 logger.info(f"---------- Iteration {num_iteration} ----------")
                 
-                # Select only ongoing items
+                # Select ongoing items
                 items_remained = [item for item in batch if not item["finished"]]
                 if len(items_remained) == 0:
                     break
+                
                 logger.info(f"Among {len(batch)} items, {len(items_remained)} items are left.")
                 
-                # Initialize batch variables
-                batch_relevant_info = []
-                batch_original_questions = []
-                batch_prev_reasonings = []
-                batch_search_queries = []
-                batch_documents = {}
-                batch_sequences = []
-
-                # Collect URLs to fetch across all sequences
-                all_urls_to_fetch = set()
-                all_queries_to_search = set()
-                url_snippets = {}
+                # Process iteration
+                items_remained = process_batch_iteration(
+                    args, logger, generator, batch, items_remained,
+                    search_cache, url_cache
+                )
                 
-                # Prepare prompts & Inference
-                prompts = [item["prompt"] for item in items_remained]
-                responses = generator.generate(
-                                prompts, 
-                                max_tokens=args.max_tokens, 
-                                stop=[END_SEARCH_QUERY], 
-                                apply_chat=False,
-                                enable_thinking=True, # 'enable_thinking = True' doesn't do anything
-                            )
-                
-                # Store raw model outputs for each item
-                items_remained_ = []
-                responses_ = []
-                for item,  response in zip(items_remained, responses):
-                    if "</think>" not in response:
-                        response = response.replace(f"\n\n{BEGIN_SEARCH_QUERY}", f"\n</think>\n\n{BEGIN_SEARCH_QUERY}")
-                    search_queries = extract_between(response, BEGIN_SEARCH_QUERY, END_SEARCH_QUERY)
-                    item["prompt"] += response
-                    item["output"] += response
-                    item["output_history"].append(response)
-
-                    # If no search queries are found, extract final answer
-                    if search_queries is None:    
-                        item["finished"] = True
-                        item["generated_answer"] = extract_answer(response)
-                        continue
-                    
-                    # Select search queries to execute
-                    relevant_info = {}
-                    for search_query in search_queries:
-                        if search_query in set(item['executed_search_queries']):
-                            repeat_msg = (
-                                f"\n{BEGIN_SEARCH_RESULT}\nYou have searched this query. "
-                                "Please refer to previous results.\n"
-                                f"{END_SEARCH_RESULT}\n"
-                            )
-                            relevant_info[search_query] = repeat_msg
-                            continue
-                        if search_query in search_cache:
-                            results = search_cache[search_query]
-                            relevant_info[search_query] = results[:args.top_k]
-                        else:
-                            all_queries_to_search.add(search_query)
-                            relevant_info[search_query] = None
-                    
-                    items_remained_.append(item)
-                    responses_.append(response)
-                    batch_relevant_info.append(relevant_info)
-                
-                items_remained = items_remained_
-                responses = responses_
-                
-                # Execute search queries
-                if all_queries_to_search:
-                    logger.info(f"Executing {len(all_queries_to_search)} queries...")
-                    all_search_results = asyncio.run(
-                        jina_web_search_all_queries(
-                            list(all_queries_to_search),
-                            jina_api_key=args.jina_api_key,
-                        )
-                    )
-                    
-                # Postprocess search results
-                for item, response, relevant_info in zip(items_remained, responses, batch_relevant_info):            
-                    # Update relevant_info with search results
-                    for query, info in relevant_info.items():
-                        if info is None:
-                            results = all_search_results[query]
-                            relevant_info[query] = results[:args.top_k]
-                            search_cache[query] = results
-                    
-                    item['relevant_info'].update(relevant_info)
-                    item['search_count'].append(len(relevant_info))
-                    item['executed_search_queries'].extend(relevant_info.keys())
-                    
-                    # Extract URLs and snippets
-                    urls_to_fetch = []
-                    snippets = {}
-                    for _, results in relevant_info.items():
-                        for info in results:
-                            if 'url' in info:
-                                urls_to_fetch.append(info['url'])
-                                if 'snippet' in info:
-                                    snippets[info['url']] = info['snippet']
-                        
-                    # Filter URLs that are not cached
-                    urls_to_fetch_filtered = [u for u in urls_to_fetch if u not in url_cache]
-                    cached_urls = [u for u in urls_to_fetch if u in url_cache]
-                    
-                    # Store info for all_urls_to_fetch and url_snippets
-                    for url in urls_to_fetch_filtered:
-                        all_urls_to_fetch.add(url)
-                        url_snippets[url] = snippets.get(url, "")
-                    
-                    # Truncate previous reasoning steps
-                    all_reasoning_steps = item['output']
-                    all_reasoning_steps = all_reasoning_steps.replace('\n\n', '\n').split("\n")
-                    truncated_prev_reasoning = ""
-                    for i, step in enumerate(all_reasoning_steps):
-                        truncated_prev_reasoning += f"Step {i + 1}: {step}\n\n"
-                    prev_steps = truncated_prev_reasoning.split('\n\n')
-                    if len(prev_steps) <= 5:
-                        truncated_prev_reasoning = '\n\n'.join(prev_steps)
-                    else:
-                        truncated_prev_reasoning = ''
-                        for i, step in enumerate(prev_steps):
-                            if i == 0 or i >= len(prev_steps) - 4 or BEGIN_SEARCH_QUERY in step or BEGIN_SEARCH_RESULT in step:
-                                truncated_prev_reasoning += step + '\n\n'
-                            else:
-                                if truncated_prev_reasoning[-len('\n\n...\n\n'):] != '\n\n...\n\n':
-                                    truncated_prev_reasoning += '...\n\n'
-                    truncated_prev_reasoning = truncated_prev_reasoning.strip('\n')
-
-                    # Collect data for batch processing
-                    batch_original_questions.append(item['question'])
-                    batch_prev_reasonings.append(truncated_prev_reasoning)
-                    batch_search_queries.append(relevant_info.keys())
-                    batch_sequences.append(item)
-                    
-                # Batch fetch all URLs at once to optimize speed
-                if all_urls_to_fetch:
-                    logger.info(f"Fetching {len(all_urls_to_fetch)} URLs...")
-                    try:
-                        fetched_contents = asyncio.run(
-                            fetch_page_content(
-                                list(all_urls_to_fetch),
-                                use_jina=args.use_jina,
-                                jina_api_key=args.jina_api_key,
-                                snippets=url_snippets  # Do not pass snippets when updating url_cache directly
-                            )
-                        )   
-                        logger.info(f"Fetched {len(fetched_contents)} URLs successfully.")
-                    except Exception as e:
-                        logger.info(f"Error during batch URL fetching: {e}")
-                        fetched_contents = {url: f"Error fetching URL: {e}" for url in all_urls_to_fetch}
-                    # Update cache with fetched contents
-                    for url, content in fetched_contents.items():
-                        url_cache[url] = content
-
-                # After fetching, prepare formatted documents for batch summarization
-                for relevant_info, executed_queries in zip(batch_relevant_info, batch_search_queries): 
-                    # relevant_info: [ [{query: doc_info}] for each search_query] for each item ] 
-                    # executed_queries: [ search_queries ] for each item 
-                    formatted_documents = {}
-                    for sub_query in executed_queries:
-                        doc_str = ""
-                        sub_relevant_info = relevant_info[sub_query]
-                        if type(sub_relevant_info) == str:
-                            formatted_documents[sub_query] = sub_relevant_info # Already searched
-                            continue
-                        for i, doc_info in enumerate(sub_relevant_info):
-                            url = doc_info.get('url', "")
-                            raw_context = url_cache.get(url, "")
-                            snippet = doc_info["snippet"].replace('<b>', '').replace('</b>', '') if doc_info["snippet"] else None
-                            doc_info['snippet'] = snippet
-                            success, filtered_context = extract_snippet_with_context(raw_context, snippet, context_chars=args.max_doc_len)
-                            context = filtered_context if success else raw_context[:args.max_doc_len]
-                            doc_info['context'] = context
-                            doc_str += f"**Web Page {i + 1}:**\n"
-                            doc_str += json.dumps(doc_info, ensure_ascii=False, indent=2) + "\n"
-                        formatted_documents[sub_query] = doc_str
-                    batch_documents.update(formatted_documents)
-
-                # Batch summarization
-                if batch_sequences:
-                    logger.info(f"Batch summarizing {len(batch_sequences)} sequences with generate_webpage_to_reasonchain_batch...")
-                    webpage_analyses = asyncio.run(
-                        generate_webpage_to_reasonchain_batch(
-                            args,
-                            logger,
-                            original_questions=batch_original_questions, # list of questions
-                            prev_reasonings=batch_prev_reasonings, # list of previous reasoning steps
-                            search_queries=batch_search_queries, # [[search_queries] for each question]
-                            documents=batch_documents, # {search_query: formatted_doc_string} for all questions
-                            dataset_name=args.dataset_name,
-                            max_tokens=args.api_model_max_tokens
-                        )
-                    )
-                    logger.info("Batch summarization completed, assigning outputs to sequences...")
-
-                    for seq, queries in zip(batch_sequences, batch_search_queries):
-                        combined_analysis = ""
-                        for query in queries:
-                            analysis = webpage_analyses[query]
-                            combined_analysis += f"{query}: {analysis}\n"
-                            seq["related_info_analysis"].append(analysis)
-                        
-                        append_text = f"\n\n{BEGIN_SEARCH_RESULT}\n{combined_analysis.strip()}\n{END_SEARCH_RESULT}\n\n<think>\n"
-                        seq['prompt'] += append_text
-                        seq['output'] += append_text            
-                
+                # Check termination conditions
                 items_remained = [item for item in items_remained if not item['finished']]
+                
                 if len(items_remained) > 0:
-                    # If the number of iterations exceeds the maximum number of iterations, continue
                     if num_iteration < args.max_iteration:
-                        continue 
-                    # Generate final answer for remaining items
+                        continue
                     else:
-                        items_to_generate_final_answer = [
-                            item for item in batch 
-                            if not item["finished"] or "generated_answer" not in item 
-                            or item["generated_answer"] == ""
-                        ]
-                        
-                        # Preprocess prompts for final answer generation
-                        def map_item(item):
-                            prompt = item["prompt"].strip() 
-                            output = item["output"].strip()
-                            while True: 
-                                if prompt.endswith(END_SEARCH_QUERY):
-                                    prompt = prompt.strip(END_SEARCH_QUERY).strip()
-                                    output = output.strip(END_SEARCH_QUERY).strip()
-                                elif prompt.endswith(BEGIN_SEARCH_QUERY):
-                                    prompt = prompt.strip(BEGIN_SEARCH_QUERY).strip()
-                                    output = output.strip(BEGIN_SEARCH_QUERY).strip()
-                                elif prompt.endswith(END_SEARCH_RESULT):
-                                    prompt = prompt.strip(END_SEARCH_RESULT).strip()
-                                    output = output.strip(END_SEARCH_RESULT).strip()
-                                elif prompt.endswith(BEGIN_SEARCH_RESULT):
-                                    prompt = prompt.strip(BEGIN_SEARCH_RESULT).strip()
-                                    output = output.strip(BEGIN_SEARCH_RESULT).strip()
-                                else:
-                                    break
-                            prompt = prompt.strip()
-                            output = output.strip()
-                            if not prompt.endswith("</think>"):
-                                prompt += "\n</think>\n\n**Final Answer:**\n\\boxed{"
-                                output += "\n</think>\n\n**Final Answer:**\n\\boxed{"
-                            item["prompt"] = prompt 
-                            item["output"] = output
-                            item["output_history"].append("\n</think>\n\n**Final Answer:**\n\\boxed{")
-                            return item
-                        
-                        # Generate final answer
-                        items_to_generate_final_answer = list(map(map_item, items_to_generate_final_answer))
-                        prompts = [item["prompt"] for item in items_to_generate_final_answer]
-                        responses = generator.generate(
-                                        prompts, 
-                                        max_tokens=args.max_tokens, 
-                                        apply_chat=False,
-                                        enable_thinking=False,
-                                    )
-                        
-                        # Postprocess outputs
-                        for item, response in zip(items_to_generate_final_answer, responses):
-                            item["prompt"] += response
-                            item["output"] += response
-                            item["output_history"][-1] += response
-                            item["finished"] = True
-                            item["generated_answer"] = response.strip("}")
-                        break 
+                        # Generate final answer for remaining items
+                        generate_final_answers(generator, batch, args)
+                        break
                 else:
                     break
+                    
         except Exception as e:
-            logger.info(f"Error: {e}")
+            logger.error(f"Error: {e}")
             save_cache(output_dir, search_cache, url_cache)
-            exit()
+            raise
     
-        # Save results
-        output_data.extend(dataset)
+        # Save batch results
+        output_data.extend(batch)
         save_cache(output_dir, search_cache, url_cache)
         logger.info(f"Saving results... {output_path_for_batch}...")
+        
         with open(output_path_for_batch, "w") as f:
             json.dump(batch, f, indent=2)
-        logger.info(f"{'*'*30}\nOutput file: {output_path_for_batch}\n{'*'*30}")
-        print("Done!")
+        
+        logger.info(f"Batch {batch_idx} completed. Output: {output_path_for_batch}")
         
     # Save final results
     save_cache(output_dir, search_cache, url_cache)
-    print(f"Saving final results... {output_path}...")
+    logger.info(f"Saving final results... {output_path}...")
+    
     with open(output_path, "w") as f:
         json.dump(output_data, f, indent=2)
-    print(f"{'*'*30}\nOutput file: {output_path}\n{'*'*30}")
     
+    logger.info(f"Output file: {output_path}")
+
+
 if __name__ == "__main__":
     main()
-    
-    
