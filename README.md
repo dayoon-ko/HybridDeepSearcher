@@ -30,8 +30,7 @@ The authors present HybridDeepSearcher, an LRM fine-tuned on HDS-QA that integra
 ### 🔧 Environment Setup
 ```bash
 cd HybridDeepSearcher
-conda env create -f environment.yml
-conda activate hybridds
+pip install -r requirements.txt
 pip install ms-swift==3.5.3
 ```
 
