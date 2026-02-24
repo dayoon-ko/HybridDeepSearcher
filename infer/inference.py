@@ -69,7 +69,7 @@ def get_args():
                         choices=["musique", "browse_comp", "hle", "gpqa", "fanoutqa", 
                                  "cwq", "hotpotqa", "med_browse_comp", "multihopqa", "frames"]) 
     parser.add_argument("--dataset_split", "-sp", default="train")
-    parser.add_argument("--model_id_or_path", "-m", default="dayoon/HybridDeepSearcher-GRPO")
+    parser.add_argument("--model_id_or_path", "-m", default="dayoon/HybridDeepSearcher")
     parser.add_argument("--apply_chat", type=bool, default=True)
     parser.add_argument("--use_jina", action="store_true", 
                         help="Whether to use jina for extracting text from urls")
